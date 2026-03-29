@@ -2,27 +2,68 @@
  * pi-session-summary — belowEditor widget showing a one-line LLM-generated session summary.
  *
  * Triggers on agent_end, debounced (default 120s).  Uses a separately configured
- * model (default google/gemini-2.5-flash-lite) so the main conversation model is untouched.
+ * model (default openai-codex/gpt-5.4-mini) so the main conversation model is untouched.
  *
- * NOTE: openai-codex does NOT work for standalone complete() calls
- * (returns "invalid_workspace_selected"). Use google, openai, anthropic, etc.
+ * Configuration via ~/.pi/agent/session-summary.json (global) or
+ * .pi/session-summary.json (project override, merged on top):
+ *
+ *   {
+ *     "provider": "openai-codex",
+ *     "model": "gpt-5.4-mini",
+ *     "debounceSeconds": 120,
+ *     "maxTokens": 300,
+ *     "resummarizeTokenThreshold": 40000
+ *   }
  *
  * Between LLM updates the widget shows a hybrid line:
  *   "[compaction | last summary] + N new turns since"
  * so the user always has recency context.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { complete } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
 
 // ── Configuration ────────────────────────────────────────────────────
-const SUMMARY_PROVIDER = "anthropic";
-const SUMMARY_MODEL_ID = "claude-haiku-4-5";
-const DEBOUNCE_SECONDS = 120;
-const MAX_TOKENS = 300;
-/** After this many tokens of new conversation we re-summarize from scratch
- *  instead of asking to update the previous line. */
-const RESUMMARIZE_TOKEN_THRESHOLD = 10_000;
+
+interface SummaryConfig {
+	provider: string;
+	model: string;
+	debounceSeconds: number;
+	maxTokens: number;
+	resummarizeTokenThreshold: number;
+}
+
+const DEFAULTS: SummaryConfig = {
+	provider: "openai-codex",
+	model: "gpt-5.4-mini",
+	debounceSeconds: 120,
+	maxTokens: 300,
+	resummarizeTokenThreshold: 40_000,
+};
+
+function loadConfig(cwd: string): SummaryConfig {
+	const globalPath = join(getAgentDir(), "session-summary.json");
+	const projectPath = join(cwd, ".pi", "session-summary.json");
+
+	let config = { ...DEFAULTS };
+
+	for (const path of [globalPath, projectPath]) {
+		if (existsSync(path)) {
+			try {
+				const content = readFileSync(path, "utf-8");
+				const parsed = JSON.parse(content);
+				config = { ...config, ...parsed };
+			} catch (err) {
+				console.error(`[session-summary] Failed to load config from ${path}: ${err}`);
+			}
+		}
+	}
+
+	return config;
+}
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -118,6 +159,7 @@ function getCompactionSummary(entries: SessionEntry[]): string | undefined {
 
 export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	// ── State ─────────────────────────────────────────────────────────
+	let config = { ...DEFAULTS };  // loaded from session-summary.json
 	let lastSummary = "";          // last successful LLM-generated summary
 	let lastSummaryConvTokens = 0; // token count of conversation when last summary was made
 	let turnsSinceSummary = 0;     // agent_end calls since last summary update
@@ -194,7 +236,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	async function generateSummary(ctx: ExtensionContext) {
 		if (pendingLLMCall) return;
 
-		const model = ctx.modelRegistry.find(SUMMARY_PROVIDER, SUMMARY_MODEL_ID);
+		const model = ctx.modelRegistry.find(config.provider, config.model);
 		if (!model) {
 			lastError = "MODEL_NOT_FOUND";
 			updateWidget(ctx);
@@ -216,7 +258,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 
 		// Decide: update previous summary or re-summarize from scratch
 		const tokensSinceLastSummary = convTokens - lastSummaryConvTokens;
-		const shouldResummarize = !lastSummary || tokensSinceLastSummary >= RESUMMARIZE_TOKEN_THRESHOLD;
+		const shouldResummarize = !lastSummary || tokensSinceLastSummary >= config.resummarizeTokenThreshold;
 
 		let prompt: string;
 		if (shouldResummarize) {
@@ -249,6 +291,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 
 		// Fire-and-forget: non-blocking async LLM call
 		complete(model, {
+			systemPrompt: "You are a concise summarizer. Output a single line summary of a coding session.",
 			messages: [{
 				role: "user" as const,
 				content: [{ type: "text" as const, text: prompt }],
@@ -257,20 +300,25 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		}, {
 			apiKey: auth.apiKey,
 			headers: auth.headers,
-			maxTokens: MAX_TOKENS,
+			maxTokens: config.maxTokens,
 			sessionId: ctx.sessionManager.getSessionId(),
 		} as any)
 			.then((response) => {
 				// Handle provider-level errors (e.g. codex "invalid_workspace_selected")
 				if (response.stopReason === "error") {
 					const errMsg = response.errorMessage || "unknown provider error";
-					// Try to extract a short code from JSON error messages
+					// Try to extract a short code/message from JSON error responses
 					let code = errMsg;
 					try {
 						const parsed = JSON.parse(errMsg);
-						code = parsed?.detail?.code || parsed?.error?.code || errMsg;
+						code = parsed?.detail?.code
+							|| parsed?.error?.code
+							|| parsed?.error?.message
+							|| (typeof parsed?.detail === "string" ? parsed.detail : null)
+							|| errMsg;
 					} catch {}
-					throw new Error(String(code));
+					lastError = String(code);
+					return; // don't update summary
 				}
 
 				const text = response.content
@@ -291,9 +339,9 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 			})
 			.catch((err) => {
 				const msg = err?.message || String(err);
-				const code = err?.code || err?.status || err?.name || msg.slice(0, 60);
+				// err.name is usually just "Error" — useless; prefer code/status/message
+				const code = err?.code || err?.status || msg.slice(0, 80);
 				lastError = String(code);
-				console.error("[session-summary] LLM error:", msg);
 			})
 			.finally(() => {
 				pendingLLMCall = false;
@@ -304,6 +352,9 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	// ── Event handlers ────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Reload config (picks up changes on /reload)
+		config = loadConfig(ctx.cwd);
+
 		// Restore state from custom entries
 		lastSummary = "";
 		lastSummaryConvTokens = 0;
@@ -328,6 +379,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
+		config = loadConfig(ctx.cwd);
 		lastSummary = "";
 		lastSummaryConvTokens = 0;
 		turnsSinceSummary = 0;
@@ -358,7 +410,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		// Debounce: only call LLM if enough time has passed
 		const now = Date.now();
 		const elapsed = now - lastSummaryTime;
-		if (elapsed < DEBOUNCE_SECONDS * 1000 && lastSummary) {
+		if (elapsed < config.debounceSeconds * 1000 && lastSummary) {
 			// Too soon — widget already shows hybrid line with turn count
 			return;
 		}
