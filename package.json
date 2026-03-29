@@ -11,7 +11,7 @@
   },
   "homepage": "https://github.com/pasky/pi-session-summary",
   "bugs": "https://github.com/pasky/pi-session-summary/issues",
-  "files": ["index.ts", "README.md"],
+  "files": ["index.ts", "README.md", "screenshot.png"],
   "pi": {
     "extensions": ["./index.ts"]
   },
