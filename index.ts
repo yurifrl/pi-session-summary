@@ -474,17 +474,12 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	pi.registerCommand("summary:cost", {
 		description: "Show summary model and its cost this session",
 		handler: async (_args, ctx) => {
+			// Ensure model is resolved fresh
+			if (!resolvedModelName) resolveModel(ctx);
 			const model = resolvedModelName || "(none)";
 			const costStr = totalCost.total > 0 ? `$${totalCost.total.toFixed(4)}` : "$0";
-			const lines = [
-				`Model: ${model}`,
-				`LLM calls: ${llmCallCount}`,
-				`Tokens — in: ${totalTokens.input}, out: ${totalTokens.output}`,
-				`Cost — total: ${costStr} (in: $${totalCost.input.toFixed(4)}, out: $${totalCost.output.toFixed(4)}, cache-r: $${totalCost.cacheRead.toFixed(4)}, cache-w: $${totalCost.cacheWrite.toFixed(4)})`,
-			];
-			for (const line of lines) {
-				ctx.ui.notify(line, "info");
-			}
+			const line = `${model} | ${llmCallCount} calls | tokens: ${totalTokens.input}→${totalTokens.output} | cost: ${costStr} (in: $${totalCost.input.toFixed(4)}, out: $${totalCost.output.toFixed(4)}, cache-r: $${totalCost.cacheRead.toFixed(4)}, cache-w: $${totalCost.cacheWrite.toFixed(4)})`;
+			ctx.ui.notify(line, "info");
 		},
 	});
 
