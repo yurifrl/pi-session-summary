@@ -1,7 +1,17 @@
 {
   "name": "pi-session-summary",
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "description": "A pi extension that maintains an LLM-generated one-line session summary as the session name",
   "keywords": ["pi-package"],
+  "license": "MIT",
+  "author": "Petr Baudis",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pasky/pi-session-summary.git"
+  },
+  "homepage": "https://github.com/pasky/pi-session-summary",
+  "bugs": "https://github.com/pasky/pi-session-summary/issues",
+  "files": ["index.ts", "README.md"],
   "pi": {
     "extensions": ["./index.ts"]
   },
