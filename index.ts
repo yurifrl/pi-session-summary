@@ -2,7 +2,10 @@
  * pi-session-summary -- belowEditor widget showing a one-line LLM-generated session summary.
  *
  * Triggers on agent_end, debounced (default 120s).  Uses a separately configured
- * model (default openai-codex/gpt-5.4-mini) so the main conversation model is untouched.
+ * model so the main conversation model is untouched.
+ *
+ * When no provider/model is configured, auto-detects the first available model
+ * from: gpt-5.4-nano, gpt-5.4-mini, gemini-3-flash, claude-4-5-haiku.
  *
  * Configuration via ~/.pi/agent/session-summary.json (global) or
  * .pi/session-summary.json (project override, merged on top):
@@ -32,26 +35,32 @@ import { getAgentDir } from "@mariozechner/pi-coding-agent";
 // -- Configuration --------------------------------------------------------
 
 interface SummaryConfig {
-	provider: string;
-	model: string;
+	provider?: string;
+	model?: string;
 	debounceSeconds: number;
 	maxTokens: number;
 	resummarizeTokenThreshold: number;
 }
 
 const DEFAULTS: SummaryConfig = {
-	provider: "openai-codex",
-	model: "gpt-5.4-mini",
 	debounceSeconds: 120,
 	maxTokens: 300,
 	resummarizeTokenThreshold: 40_000,
 };
 
+/** Models to try in order when no explicit model is configured. */
+const AUTO_DETECT_MODELS = [
+	"gpt-5.4-nano",
+	"gpt-5.4-mini",
+	"gemini-3-flash",
+	"claude-4-5-haiku",
+];
+
 function loadConfig(cwd: string): SummaryConfig {
 	const globalPath = join(getAgentDir(), "session-summary.json");
 	const projectPath = join(cwd, ".pi", "session-summary.json");
 
-	let config = { ...DEFAULTS };
+	let config: SummaryConfig = { ...DEFAULTS };
 
 	for (const path of [globalPath, projectPath]) {
 		if (existsSync(path)) {
@@ -162,7 +171,8 @@ function getCompactionSummary(entries: SessionEntry[]): string | undefined {
 
 export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	// -- State ------------------------------------------------------------
-	let config = { ...DEFAULTS };  // loaded from session-summary.json
+	let config: SummaryConfig = { ...DEFAULTS };  // loaded from session-summary.json
+	let resolvedModelName = "";  // display name of the auto-detected or configured model
 	let totalCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 	let totalTokens = { input: 0, output: 0 };
 	let llmCallCount = 0;
@@ -212,9 +222,33 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		lastSummaryTime = 0;
 		pendingLLMCall = false;
 		lastError = "";
+		resolvedModelName = "";
 		totalCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 		totalTokens = { input: 0, output: 0 };
 		llmCallCount = 0;
+	}
+
+	// -- Model auto-detection ---------------------------------------------
+
+	/** Resolve the model to use: explicit config or auto-detect from available models. */
+	function resolveModel(ctx: ExtensionContext): { provider: string; model: string } | undefined {
+		if (config.provider && config.model) {
+			resolvedModelName = `${config.provider}/${config.model}`;
+			return { provider: config.provider, model: config.model };
+		}
+
+		// Auto-detect: find the first available model from the priority list
+		const available = ctx.modelRegistry.getAvailable();
+		for (const candidateId of AUTO_DETECT_MODELS) {
+			const match = available.find((m) => m.id === candidateId);
+			if (match) {
+				resolvedModelName = `${match.provider}/${match.id}`;
+				return { provider: match.provider, model: match.id };
+			}
+		}
+
+		resolvedModelName = "";
+		return undefined;
 	}
 
 	// -- Widget rendering -------------------------------------------------
@@ -247,8 +281,14 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		}
 
 		if (parts.length === 0 && turnsSinceSummary === 0) {
-			// Nothing to show yet
-			ctx.ui.setWidget("session-summary", undefined);
+			// Nothing to show yet — display waiting message with model info
+			if (resolvedModelName) {
+				ctx.ui.setWidget("session-summary", [`Waiting for first message (will use ${resolvedModelName} to summarize)`], { placement: "belowEditor" });
+			} else if (lastError) {
+				ctx.ui.setWidget("session-summary", [`[session-summary] ${lastError}`], { placement: "belowEditor" });
+			} else {
+				ctx.ui.setWidget("session-summary", undefined);
+			}
 			return;
 		}
 
@@ -285,7 +325,14 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	async function generateSummary(ctx: ExtensionContext) {
 		if (pendingLLMCall) return;
 
-		const model = ctx.modelRegistry.find(config.provider, config.model);
+		const resolved = resolveModel(ctx);
+		if (!resolved) {
+			lastError = "No summary model available (tried: " + AUTO_DETECT_MODELS.join(", ") + ")";
+			updateWidget(ctx);
+			return;
+		}
+
+		const model = ctx.modelRegistry.find(resolved.provider, resolved.model);
 		if (!model) {
 			lastError = "MODEL_NOT_FOUND";
 			updateWidget(ctx);
@@ -421,7 +468,14 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 			const globalPath = join(getAgentDir(), "session-summary.json");
 			if (!existsSync(globalPath)) {
 				mkdirSync(dirname(globalPath), { recursive: true });
-				writeFileSync(globalPath, JSON.stringify(DEFAULTS, null, 2) + "\n");
+				// Materialize the resolved model (auto-detected or configured) into the settings
+				const resolved = resolveModel(ctx);
+				const settingsToWrite = {
+					...DEFAULTS,
+					provider: resolved?.provider ?? "",
+					model: resolved?.model ?? "",
+				};
+				writeFileSync(globalPath, JSON.stringify(settingsToWrite, null, 2) + "\n");
 				ctx.ui.notify(`Created ${globalPath}`, "success");
 			} else {
 				ctx.ui.notify(`Settings file already exists: ${globalPath}`, "info");
@@ -473,7 +527,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	pi.registerCommand("summary:cost", {
 		description: "Show summary model and its cost this session",
 		handler: async (_args, ctx) => {
-			const model = `${config.provider}/${config.model}`;
+			const model = resolvedModelName || "(none)";
 			const costStr = totalCost.total > 0 ? `$${totalCost.total.toFixed(4)}` : "$0";
 			const lines = [
 				`Model: ${model}`,
@@ -495,6 +549,12 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		resetState();
 		latestCtx = ctx;
 
+		// Resolve model early so waiting message shows model name
+		const resolved = resolveModel(ctx);
+		if (!resolved) {
+			lastError = "No summary model available (tried: " + AUTO_DETECT_MODELS.join(", ") + ")";
+		}
+
 		// Check for persisted summary
 		restoreFromEntries(ctx);
 		updateWidget(ctx);
@@ -509,6 +569,12 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		config = loadConfig(ctx.cwd);
 		resetState();
 		latestCtx = ctx;
+
+		// Resolve model early so waiting message shows model name
+		const resolved = resolveModel(ctx);
+		if (!resolved) {
+			lastError = "No summary model available (tried: " + AUTO_DETECT_MODELS.join(", ") + ")";
+		}
 
 		// Restore from new session (empty for /new, populated for /resume)
 		restoreFromEntries(ctx);
