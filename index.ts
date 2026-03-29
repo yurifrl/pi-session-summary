@@ -1,5 +1,5 @@
 /**
- * pi-session-summary — belowEditor widget showing a one-line LLM-generated session summary.
+ * pi-session-summary -- belowEditor widget showing a one-line LLM-generated session summary.
  *
  * Triggers on agent_end, debounced (default 120s).  Uses a separately configured
  * model (default openai-codex/gpt-5.4-mini) so the main conversation model is untouched.
@@ -18,6 +18,9 @@
  * Between LLM updates the widget shows a hybrid line:
  *   "[compaction | last summary] + N new turns since"
  * so the user always has recency context.
+ *
+ * The summary is also set as the session name (pi.setSessionName) so it
+ * appears as the oneliner in /resume's session selector.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -26,7 +29,7 @@ import { complete } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 
-// ── Configuration ────────────────────────────────────────────────────
+// -- Configuration --------------------------------------------------------
 
 interface SummaryConfig {
 	provider: string;
@@ -65,7 +68,7 @@ function loadConfig(cwd: string): SummaryConfig {
 	return config;
 }
 
-// ── Types ────────────────────────────────────────────────────────────
+// -- Types ----------------------------------------------------------------
 
 interface ContentBlock {
 	type?: string;
@@ -85,7 +88,7 @@ interface SessionEntry {
 	};
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
+// -- Helpers --------------------------------------------------------------
 
 /** Rough token estimate: ~4 chars per token. */
 function estimateTokens(text: string): number {
@@ -155,10 +158,10 @@ function getCompactionSummary(entries: SessionEntry[]): string | undefined {
 	return undefined;
 }
 
-// ── Extension ────────────────────────────────────────────────────────
+// -- Extension ------------------------------------------------------------
 
 export default function sessionSummaryExtension(pi: ExtensionAPI) {
-	// ── State ─────────────────────────────────────────────────────────
+	// -- State ------------------------------------------------------------
 	let config = { ...DEFAULTS };  // loaded from session-summary.json
 	let lastSummary = "";          // last successful LLM-generated summary
 	let lastSummaryConvTokens = 0; // token count of conversation when last summary was made
@@ -168,7 +171,47 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	let lastError = "";            // last error (code only)
 	let latestCtx: ExtensionContext | undefined; // most recent ctx for widget updates
 
-	// ── Widget rendering ──────────────────────────────────────────────
+	// -- Persist + session name helpers -----------------------------------
+
+	/** Persist summary to session and update session name for /resume. */
+	function persistSummary() {
+		if (lastSummary) {
+			pi.appendEntry("session-summary", {
+				summary: lastSummary,
+				convTokens: lastSummaryConvTokens,
+			});
+			pi.setSessionName(lastSummary);
+		}
+	}
+
+	/** Restore summary state from session entries. */
+	function restoreFromEntries(ctx: ExtensionContext) {
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if ((entry as any).type === "custom" && (entry as any).customType === "session-summary") {
+				const data = (entry as any).data;
+				if (data?.summary) {
+					lastSummary = data.summary;
+					lastSummaryConvTokens = data.convTokens ?? 0;
+				}
+			}
+		}
+		// Restore session name from persisted summary
+		if (lastSummary) {
+			pi.setSessionName(lastSummary);
+		}
+	}
+
+	/** Reset all in-memory state to blank. */
+	function resetState() {
+		lastSummary = "";
+		lastSummaryConvTokens = 0;
+		turnsSinceSummary = 0;
+		lastSummaryTime = 0;
+		pendingLLMCall = false;
+		lastError = "";
+	}
+
+	// -- Widget rendering -------------------------------------------------
 
 	function updateWidget(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
@@ -208,10 +251,10 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		// Staleness indicators
 		if (turnsSinceSummary > 0) {
 			if (lastSummary) {
-				// Summary exists but is stale — prepend age
+				// Summary exists but is stale -- prepend age
 				line = `[${turnsSinceSummary} turn${turnsSinceSummary > 1 ? "s" : ""} ago] ${line}`;
 			} else {
-				// No summary yet — show turn count as the content
+				// No summary yet -- show turn count as the content
 				const turnsLabel = turnsSinceSummary === 1 ? "1 new turn" : `${turnsSinceSummary} new turns`;
 				line = line ? `${line} + ${turnsLabel}` : turnsLabel;
 			}
@@ -231,7 +274,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		ctx.ui.setWidget("session-summary", [line], { placement: "belowEditor" });
 	}
 
-	// ── LLM summary generation ────────────────────────────────────────
+	// -- LLM summary generation -------------------------------------------
 
 	async function generateSummary(ctx: ExtensionContext) {
 		if (pendingLLMCall) return;
@@ -335,11 +378,13 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 					turnsSinceSummary = 0;
 					lastSummaryTime = Date.now();
 					lastError = "";
+					// Update session name so it shows in /resume
+					pi.setSessionName(lastSummary);
 				}
 			})
 			.catch((err) => {
 				const msg = err?.message || String(err);
-				// err.name is usually just "Error" — useless; prefer code/status/message
+				// err.name is usually just "Error" -- useless; prefer code/status/message
 				const code = err?.code || err?.status || msg.slice(0, 80);
 				lastError = String(code);
 			})
@@ -349,56 +394,31 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 			});
 	}
 
-	// ── Event handlers ────────────────────────────────────────────────
+	// -- Event handlers ---------------------------------------------------
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Reload config (picks up changes on /reload)
 		config = loadConfig(ctx.cwd);
-
-		// Restore state from custom entries
-		lastSummary = "";
-		lastSummaryConvTokens = 0;
-		turnsSinceSummary = 0;
-		lastSummaryTime = 0;
-		pendingLLMCall = false;
-		lastError = "";
+		resetState();
 		latestCtx = ctx;
 
 		// Check for persisted summary
-		for (const entry of ctx.sessionManager.getEntries()) {
-			if ((entry as any).type === "custom" && (entry as any).customType === "session-summary") {
-				const data = (entry as any).data;
-				if (data?.summary) {
-					lastSummary = data.summary;
-					lastSummaryConvTokens = data.convTokens ?? 0;
-				}
-			}
-		}
-
+		restoreFromEntries(ctx);
 		updateWidget(ctx);
+	});
+
+	// Persist summary before switching away (covers /new and /resume)
+	pi.on("session_before_switch", async (_event, _ctx) => {
+		persistSummary();
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		config = loadConfig(ctx.cwd);
-		lastSummary = "";
-		lastSummaryConvTokens = 0;
-		turnsSinceSummary = 0;
-		lastSummaryTime = 0;
-		pendingLLMCall = false;
-		lastError = "";
+		resetState();
 		latestCtx = ctx;
 
-		// Restore from new session
-		for (const entry of ctx.sessionManager.getEntries()) {
-			if ((entry as any).type === "custom" && (entry as any).customType === "session-summary") {
-				const data = (entry as any).data;
-				if (data?.summary) {
-					lastSummary = data.summary;
-					lastSummaryConvTokens = data.convTokens ?? 0;
-				}
-			}
-		}
-
+		// Restore from new session (empty for /new, populated for /resume)
+		restoreFromEntries(ctx);
 		updateWidget(ctx);
 	});
 
@@ -411,7 +431,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		const now = Date.now();
 		const elapsed = now - lastSummaryTime;
 		if (elapsed < config.debounceSeconds * 1000 && lastSummary) {
-			// Too soon — widget already shows hybrid line with turn count
+			// Too soon -- widget already shows hybrid line with turn count
 			return;
 		}
 
@@ -421,11 +441,6 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 
 	// Persist summary on shutdown so it survives restarts
 	pi.on("session_shutdown", async (_event, _ctx) => {
-		if (lastSummary) {
-			pi.appendEntry("session-summary", {
-				summary: lastSummary,
-				convTokens: lastSummaryConvTokens,
-			});
-		}
+		persistSummary();
 	});
 }
