@@ -39,10 +39,11 @@ All fields are optional — only specify what you want to override:
 {
   "provider": "openai-codex",
   "model": "gpt-5.4-mini",
-  "debounceSeconds": 120,
+  "debounceSeconds": 60,
   "maxTokens": 300,
   "resummarizeTokenThreshold": 40000,
-  "showWidget": false
+  "showWidget": false,
+  "verbose": false
 }
 ```
 
@@ -50,7 +51,8 @@ All fields are optional — only specify what you want to override:
 |---------|---------|-------------|
 | `provider` | *(auto-detect)* | Model provider |
 | `model` | *(auto-detect)* | Model ID |
-| `debounceSeconds` | `120` | Min seconds between LLM calls |
+| `debounceSeconds` | `60` | Min seconds between LLM calls |
 | `maxTokens` | `300` | Max tokens for LLM response |
 | `resummarizeTokenThreshold` | `40000` | Token threshold for full re-summarize vs incremental update |
 | `showWidget` | `false` | Show a belowEditor widget with summary, staleness, and compaction info |
+| `verbose` | `false` | Show a notification whenever the summary changes |
