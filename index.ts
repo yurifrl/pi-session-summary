@@ -210,6 +210,18 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 	// -- Widget rendering -------------------------------------------------
 
 	function updateWidget(ctx: ExtensionContext) {
+		try {
+			updateWidgetInner(ctx);
+		} catch (err: any) {
+			// Stale ctx after session replacement/reload, or UI gone away. Swallow.
+			if (!String(err?.message || err).includes("stale")) {
+				// Unexpected error -- surface via lastError for debugging but don't crash turn
+				lastError = String(err?.message || err).slice(0, 100);
+			}
+		}
+	}
+
+	function updateWidgetInner(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
 		if (!config.showWidget) {
 			ctx.ui.setWidget("session-summary", undefined);
@@ -408,11 +420,11 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 					lastSummaryTime = Date.now();
 					lastError = "";
 					// Update session name so it shows in /resume
-					pi.setSessionName(lastSummary);
+					try { pi.setSessionName(lastSummary); } catch { /* stale session, ignore */ }
 					// Verbose notification
 					if (config.verbose && changed && latestCtx?.hasUI) {
 						const mode = shouldResummarize ? "resummarize" : "incremental";
-						latestCtx.ui.notify(`[summary:${mode}] ${lastSummary}`, "info");
+						try { latestCtx.ui.notify(`[summary:${mode}] ${lastSummary}`, "info"); } catch { /* stale ctx */ }
 					}
 				}
 			})
@@ -424,7 +436,9 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 			})
 			.finally(() => {
 				pendingLLMCall = false;
-				if (latestCtx) updateWidget(latestCtx);
+				if (latestCtx) {
+					try { updateWidget(latestCtx); } catch { /* stale ctx after session reload */ }
+				}
 			});
 	}
 

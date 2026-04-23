@@ -1,0 +1,117 @@
+name: Smart Fork Sync
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  repository_dispatch:
+    types: [upstream_changed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and check changes
+        id: check
+        run: |
+          UPSTREAM_REPO="${{ vars.UPSTREAM_REPO }}"
+          if [ -z "$UPSTREAM_REPO" ]; then
+            UPSTREAM_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // empty')
+          fi
+          if [ -z "$UPSTREAM_REPO" ]; then
+            echo "::error::Not a fork and UPSTREAM_REPO not set"
+            exit 1
+          fi
+          echo "UPSTREAM_REPO=$UPSTREAM_REPO" >> "$GITHUB_ENV"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream main
+
+          BEHIND=$(git rev-list --count origin/main..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Already up to date"
+          else
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            echo "🔄 Fork is $BEHIND commit(s) behind upstream"
+            git log --oneline origin/main..upstream/main
+          fi
+
+      - name: Rebase fork on upstream
+        if: steps.check.outputs.synced == 'false'
+        id: rebase
+        run: |
+          git checkout main
+          FORK_COMMITS=$(git rev-list --count upstream/main..origin/main)
+          echo "fork_commits=$FORK_COMMITS" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORK_COMMITS" -eq 0 ]; then
+            # No fork commits, fast-forward
+            git merge --ff-only upstream/main
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+            echo "method=ff" >> "$GITHUB_OUTPUT"
+          else
+            if git rebase upstream/main 2>&1; then
+              echo "status=clean" >> "$GITHUB_OUTPUT"
+              echo "method=rebase" >> "$GITHUB_OUTPUT"
+            else
+              git rebase --abort
+              echo "status=conflict" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Push clean rebase
+        if: steps.check.outputs.synced == 'false' && steps.rebase.outputs.status == 'clean'
+        run: git push origin main --force-with-lease
+
+      - name: Claude resolve conflicts
+        if: steps.check.outputs.synced == 'false' && steps.rebase.outputs.status == 'conflict'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          npm install -g @anthropic-ai/claude-code
+
+          claude -p \
+            --permission-mode bypassPermissions \
+            --allowedTools "Bash(git *)" \
+            --max-turns 20 \
+            "You are syncing a git fork with its upstream. The automated rebase failed due to conflicts.
+
+          Current state: you are on the main branch, rebase was aborted.
+
+          Your job:
+          1. Identify fork-only commits: git log --oneline upstream/main..origin/main
+          2. Start the rebase: git rebase upstream/main
+          3. For each conflict:
+             - Read the conflicted files, examine conflict markers
+             - Resolve keeping BOTH upstream AND fork changes merged
+             - Fork customizations take priority on true conflicts
+             - Stage resolved files with git add
+             - Continue with: GIT_EDITOR=true git rebase --continue
+          4. If a fork commit becomes empty after rebase, skip with: git rebase --skip
+          5. After success, verify fork commits are on TOP: git log --oneline -20
+          6. Push with: git push origin main --force-with-lease
+
+          RULES:
+          - Fork commits MUST be at the top of history
+          - Never drop or squash fork commits
+          - If resolution is ambiguous, prefer upstream code but keep the fork commit"
