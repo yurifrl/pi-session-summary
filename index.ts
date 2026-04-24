@@ -1,8 +1,21 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { complete } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
+
+// -- Debug logging --------------------------------------------------------
+// Logs every error to ~/.pi/agent/session-summary.log so stale-ctx and other
+// silently-swallowed failures are visible for diagnosis. Truncated to 1MB.
+
+function logErr(where: string, err: unknown): void {
+	try {
+		const path = join(getAgentDir(), "session-summary.log");
+		const msg = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack || ""}` : String(err);
+		const line = `[${new Date().toISOString()}] [${where}] ${msg}\n`;
+		appendFileSync(path, line);
+	} catch { /* logging must never throw */ }
+}
 
 // -- Configuration --------------------------------------------------------
 
@@ -213,6 +226,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 		try {
 			updateWidgetInner(ctx);
 		} catch (err: any) {
+			logErr("updateWidget", err);
 			// Stale ctx after session replacement/reload, or UI gone away. Swallow.
 			if (!String(err?.message || err).includes("stale")) {
 				// Unexpected error -- surface via lastError for debugging but don't crash turn
@@ -420,15 +434,16 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 					lastSummaryTime = Date.now();
 					lastError = "";
 					// Update session name so it shows in /resume
-					try { pi.setSessionName(lastSummary); } catch { /* stale session, ignore */ }
+					try { pi.setSessionName(lastSummary); } catch (e) { logErr("setSessionName", e); }
 					// Verbose notification
 					if (config.verbose && changed && latestCtx?.hasUI) {
 						const mode = shouldResummarize ? "resummarize" : "incremental";
-						try { latestCtx.ui.notify(`[summary:${mode}] ${lastSummary}`, "info"); } catch { /* stale ctx */ }
+						try { latestCtx.ui.notify(`[summary:${mode}] ${lastSummary}`, "info"); } catch (e) { logErr("notify", e); }
 					}
 				}
 			})
 			.catch((err) => {
+				logErr("complete", err);
 				const msg = err?.message || String(err);
 				// err.name is usually just "Error" -- useless; prefer code/status/message
 				const code = err?.code || err?.status || msg.slice(0, 80);
@@ -437,7 +452,7 @@ export default function sessionSummaryExtension(pi: ExtensionAPI) {
 			.finally(() => {
 				pendingLLMCall = false;
 				if (latestCtx) {
-					try { updateWidget(latestCtx); } catch { /* stale ctx after session reload */ }
+					try { updateWidget(latestCtx); } catch (e) { logErr("finally.updateWidget", e); }
 				}
 			});
 	}
